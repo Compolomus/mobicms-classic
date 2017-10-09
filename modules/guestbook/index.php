@@ -47,6 +47,10 @@ $translator->addTranslationFilePattern('gettext', __DIR__ . '/locale', '/%s/defa
 /** @var League\Plates\Engine $view */
 $view = $container->get(League\Plates\Engine::class);
 
+// TODO: тут замутить подключение фабрики
+use Compolomus\LSQLQueryBuilder\Builder;
+$builder = new Builder;
+
 $id = isset($_REQUEST['id']) ? abs(intval($_REQUEST['id'])) : 0;
 $act = isset($queryParams['act']) ? trim($queryParams['act']) : '';
 
@@ -77,7 +81,8 @@ switch ($act) {
         // Удаление отдельного поста
         if ($systemUser->rights >= 6 && $id) {
             if (isset($queryParams['yes'])) {
-                $db->exec('DELETE FROM `guest` WHERE `id` = ' . $id);
+                $db->prepare($builder->setTable('guest')->delete($id))
+                    ->execute($builder->placeholders());
                 header('Location: ?');
             } else {
                 echo '<div class="phdr"><a href="index.php"><b>' . _t('Guestbook') . '</b></a> | ' . _t('Delete message') . '</div>' .
@@ -131,11 +136,16 @@ switch ($act) {
             $flood = $tools->antiflood();
         } else {
             // Антифлуд для гостей
-            $req = $db->query("SELECT `time` FROM `guest` WHERE `ip` = " . $db->quote($request->getAttribute('ip')) . " AND `browser` = " . $db->quote($request->getAttribute('user_agent')) . " AND `time` > '" . (time() - 60) . "'");
+            $attr = [
+                ['ip', '=', $request->getAttribute('ip')],
+                ['browser', '=', $request->getAttribute('user_agent')],
+                ['time', '>', (time() - 60)]
+            ];
+            $req = $db->prepare($builder->setTable('guest')->select(['time'])->where($attr));
+            $req->execute($builder->placeholders());
 
-            if ($req->rowCount()) {
-                $res = $req->fetch();
-                $flood = 60 - (time() - $res['time']);
+            if ($time = $req->fetchColumn()) {
+                $flood = 60 - (time() - $time);
             }
         }
 
@@ -145,10 +155,14 @@ switch ($act) {
 
         if (!$error) {
             // Проверка на одинаковые сообщения
-            $req = $db->query("SELECT * FROM `guest` WHERE `user_id` = '" . $systemUser->id . "' ORDER BY `time` DESC");
-            $res = $req->fetch();
+            $req = $db->prepare(
+                $builder->setTable('guest')->select(['text'])
+                ->where([['user_id', '=', $systemUser->id]])
+                ->order(['time'], 'desc')
+            );
+            $req->execute($builder->placeholders());
 
-            if ($res['text'] == $msg) {
+            if ($req->fetchColumn() == $msg) {
                 header('Location: ?');
                 exit;
             }
@@ -156,31 +170,37 @@ switch ($act) {
 
         if (!$error) {
             // Вставляем сообщение в базу
-            $db->prepare("INSERT INTO `guest` SET
-                `adm` = ?,
-                `time` = ?,
-                `user_id` = ?,
-                `name` = ?,
-                `text` = ?,
-                `ip` = ?,
-                `browser` = ?,
-                `otvet` = ''
-            ")->execute([
-                $admset,
-                time(),
-                $systemUser->id,
-                $from,
-                $msg,
-                $request->getAttribute('ip'),
-                $request->getAttribute('user_agent'),
-            ]);
+            $db->prepare($builder
+                ->setTable('guest')
+                ->insert()
+                ->fields([
+                    'adm',
+                    'time',
+                    'user_id',
+                    'name',
+                    'text',
+                    'ip',
+                    'browser',
+                    'otvet'
+            ]))->execute([
+                    $admset,
+                    time(),
+                    $systemUser->id,
+                    $from,
+                    $msg,
+                    $request->getAttribute('ip'),
+                    $request->getAttribute('user_agent'),
+                    ''
+                ]);
 
             // Фиксируем время последнего поста (антиспам)
             if ($systemUser->isValid()) {
                 $postguest = $systemUser->postguest + 1;
-                $db->exec("UPDATE `users` SET `postguest` = '$postguest', `lastpost` = '" . time() . "' WHERE `id` = " . $systemUser->id);
+                $req = $db->prepare($builder->setTable('users')->update([
+                    'postguest' => $postguest, 'lastpost' => time()
+                ])->where([['id', '=', $systemUser->id]]));
+                $req->execute($builder->placeholders());
             }
-
             header('Location: ?');
         } else {
             echo $tools->displayError($error, '<a href="index.php">' . _t('Back') . '</a>');
@@ -196,16 +216,25 @@ switch ($act) {
                 && $postParams['token'] == $_SESSION['token']
             ) {
                 $reply = isset($postParams['otv']) ? mb_substr(trim($postParams['otv']), 0, 5000) : '';
-                $db->exec("UPDATE `guest` SET
-                    `admin` = '" . $systemUser->name . "',
-                    `otvet` = " . $db->quote($reply) . ",
-                    `otime` = '" . time() . "'
-                    WHERE `id` = '$id'
-                ");
+                $req = $db->prepare($builder
+                    ->setTable('guest')
+                    ->update([
+                        'admin' => $systemUser->name,
+                        'otvet' => $reply,
+                        'otime' => time()
+                    ])
+                    ->where([['id', '=', $id]])
+                );
+                $req->execute($builder->placeholders());
                 header('Location: ?');
             } else {
                 echo '<div class="phdr"><a href="index.php"><b>' . _t('Guestbook') . '</b></a> | ' . _t('Reply') . '</div>';
-                $req = $db->query("SELECT * FROM `guest` WHERE `id` = '$id'");
+                $req = $db->prepare($builder
+                    ->setTable('guest')
+                    ->select()
+                    ->where([['id', '=', $id]])
+                );
+                $req->execute($builder->placeholders());
                 $res = $req->fetch();
                 $token = mt_rand(1000, 100000);
                 $_SESSION['token'] = $token;
@@ -233,29 +262,39 @@ switch ($act) {
                 && isset($_SESSION['token'])
                 && $postParams['token'] == $_SESSION['token']
             ) {
-                $res = $db->query("SELECT `edit_count` FROM `guest` WHERE `id`='$id'")->fetch();
-                $edit_count = $res['edit_count'] + 1;
+                $req = $db->prepare($builder
+                    ->setTable('guest')
+                    ->select(['edit_count'])
+                    ->where([['id', '=', $id]])
+                );
+                $req->execute($builder->placeholders());
+                $edit_count = $req->fetchColumn() + 1;
                 $msg = isset($postParams['msg']) ? mb_substr(trim($postParams['msg']), 0, 5000) : '';
 
-                $db->prepare('
-                  UPDATE `guest` SET
-                  `text` = ?,
-                  `edit_who` = ?,
-                  `edit_time` = ?,
-                  `edit_count` = ?
-                  WHERE `id` = ?
-                ')->execute([
-                    $msg,
-                    $systemUser->name,
-                    time(),
-                    $edit_count,
-                    $id,
+                $db->prepare($builder
+                    ->setTable('guest')
+                    ->update()
+                    ->fields([
+                        'text',
+                        'edit_who',
+                        'edit_time',
+                        'edit_count'
+                    ]))->execute([
+                        $msg,
+                        $systemUser->name,
+                        time(),
+                        $edit_count,
+                        $id,
                 ]);
                 header('Location: ?');
             } else {
                 $token = mt_rand(1000, 100000);
                 $_SESSION['token'] = $token;
-                $res = $db->query("SELECT * FROM `guest` WHERE `id` = '$id'")->fetch();
+                $req = $db->prepare($builder->setTable('guest')
+                    ->select()
+                    ->where([['id', '=', $id]]));
+                $req->execute($builder->placeholders());
+                $res = $req->fetch();
                 $text = htmlentities($res['text'], ENT_QUOTES, 'UTF-8');
                 echo '<div class="phdr"><a href="index.php"><b>' . _t('Guestbook') . '</b></a> | ' . _t('Edit') . '</div>' .
                     '<div class="rmenu">' .
@@ -282,18 +321,42 @@ switch ($act) {
                 switch ($cl) {
                     case '1':
                         // Чистим сообщения, старше 1 дня
-                        $db->exec("DELETE FROM `guest` WHERE `adm`='$adm' AND `time` < '" . (time() - 86400) . "'");
+                        $sql = $builder
+                            ->setTable('guest')
+                            ->delete()
+                            ->where([
+                                ['adm', '=', $adm],
+                                ['time', '<', time() - 86400],
+                            ]);
+                        $db->prepare($builder
+                            ->setTable('guest')
+                            ->delete()
+                            ->where([
+                                ['adm', '=', $adm],
+                                ['time', '<', time() - 86400]
+                            ]))
+                            ->execute($builder->placeholders());
                         echo '<p>' . _t('All messages older than 1 day were deleted') . '</p>';
                         break;
 
                     case '2':
                         // Проводим полную очистку
-                        $db->exec("DELETE FROM `guest` WHERE `adm`='$adm'");
+                        $db->prepare($builder
+                            ->setTable('guest')
+                            ->delete($adm, 'adm'))
+                            ->execute($builder->placeholders());
                         echo '<p>' . _t('Full clearing is finished') . '</p>';
                         break;
                     default :
                         // Чистим сообщения, старше 1 недели
-                        $db->exec("DELETE FROM `guest` WHERE `adm`='$adm' AND `time`<='" . (time() - 604800) . "';");
+                        $db->prepare($builder
+                            ->setTable('guest')
+                            ->delete()
+                            ->where([
+                                ['adm', '=', $adm],
+                                ['time', '<', time() - 604800]
+                            ]))
+                            ->execute($builder->placeholders());
                         echo '<p>' . _t('All messages older than 1 week were deleted') . '</p>';
                 }
 
@@ -371,7 +434,16 @@ switch ($act) {
             echo '<div class="rmenu">' . _t('For registered users only') . '</div>';
         }
 
-        $total = $db->query("SELECT COUNT(*) FROM `guest` WHERE `adm`='" . (isset($_SESSION['ga']) ? 1 : 0) . "'")->fetchColumn();
+        $sql = $builder
+            ->setTable('guest')
+            ->count()
+            ->where([['adm', '=', isset($_SESSION['ga']) ? 1 : 0]]);
+        $req = $db->prepare($builder
+                ->setTable('guest')
+                ->count('*', 'count')
+                ->where([['adm', '=', isset($_SESSION['ga']) ? 1 : 0]]));
+        $req->execute($builder->placeholders());
+        $total = $req->fetchColumn();
         echo '<div class="phdr"><b>' . _t('Comments') . '</b></div>';
 
         if ($total > $userConfig->kmess) {
@@ -379,18 +451,31 @@ switch ($act) {
         }
 
         if ($total) {
-            if (isset($_SESSION['ga']) && ($systemUser->rights >= 1 || in_array($systemUser->id, $guestAccess))) {
-                // Запрос для Админ клуба
+            // Запрос для Админ клуба или обычной Гастивухи
+            $admField = (isset($_SESSION['ga']) && ($systemUser->rights >= 1 || in_array($systemUser->id, $guestAccess))) ? 1 : 0;
+            if ($admField) {
                 echo '<div class="rmenu"><b>АДМИН-КЛУБ</b></div>';
-                $req = $db->query("SELECT `guest`.*, `guest`.`id` AS `gid`, `users`.`rights`, `users`.`lastdate`, `users`.`sex`, `users`.`status`, `users`.`datereg`, `users`.`id`
-                FROM `guest` LEFT JOIN `users` ON `guest`.`user_id` = `users`.`id`
-                WHERE `guest`.`adm`='1' ORDER BY `time` DESC" . $tools->getPgStart(true));
-            } else {
-                // Запрос для обычной Гастивухи
-                $req = $db->query("SELECT `guest`.*, `guest`.`id` AS `gid`, `users`.`rights`, `users`.`lastdate`, `users`.`sex`, `users`.`status`, `users`.`datereg`, `users`.`id`
-                FROM `guest` LEFT JOIN `users` ON `guest`.`user_id` = `users`.`id`
-                WHERE `guest`.`adm`='0' ORDER BY `time` DESC" . $tools->getPgStart(true));
             }
+            $req = $db->prepare($builder
+                ->setTable('guest')
+                ->select([
+                    'guest.*',
+                    'guest.id' => 'gid',
+                    'users.rights',
+                    'users.lastdate',
+                    'users.sex',
+                    'users.status',
+                    'users.datereg',
+                    'users.id'
+                ])
+                ->join('users', null, [['user_id', 'id']])
+                ->where([
+                    ['guest.adm', '=', $admField]
+                ])
+                ->order(['time'], 'desc')
+                ->limit($tools->getPgStart(), $userConfig->kmess, 'limit'));
+
+            $req->execute($builder->placeholders());
 
             for ($i = 0; $res = $req->fetch(); ++$i) {
                 $text = '';
@@ -398,8 +483,15 @@ switch ($act) {
 
                 if (!$res['id']) {
                     // Запрос по гостям
-                    $res_g = $db->query("SELECT `lastdate` FROM `cms_sessions` WHERE `session_id` = '" . md5($res['ip'] . $res['browser']) . "' LIMIT 1")->fetch();
-                    $res['lastdate'] = $res_g['lastdate'];
+                    $res_g = $db->prepare($builder
+                        ->setTable('cms_sessions')
+                        ->select(['lastdate'])
+                        ->where([
+                            ['session_id' , '=', md5($res['ip'] . $res['browser'])]
+                        ])
+                        ->limit(1))
+                        ->fetchColumn();
+                    $res['lastdate'] = $res_g;
                 }
 
                 // Время создания поста
